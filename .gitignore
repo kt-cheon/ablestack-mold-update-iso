@@ -1,0 +1,15 @@
+# RPM 입력과 ISO 결과는 제외하고 빈 디렉터리 구조만 유지한다.
+/rpms/*
+!/rpms/.gitkeep
+/dist/*
+!/dist/.gitkeep
+*.rpm
+*.iso
+
+# 로컬 검증용 테스트 (ISO 생성 및 업데이트 실행에는 불필요)
+/tests/
+
+# 로컬 개발 환경 파일
+__pycache__/
+*.py[cod]
+.DS_Store
