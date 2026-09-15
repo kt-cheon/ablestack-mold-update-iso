@@ -51,7 +51,7 @@ mkdir -p "$(dirname "$OUTPUT")"
 OUTPUT="$(cd "$(dirname "$OUTPUT")" && pwd -P)/$(basename "$OUTPUT")"
 [ ! -e "$OUTPUT" ] && [ ! -L "$OUTPUT" ] || fail "출력 파일이 이미 있습니다: $OUTPUT"
 [ -f "$SCRIPT_DIR/update-mold.sh" ] || fail 'update-mold.sh가 필요합니다.'
-[ -f "$SCRIPT_DIR/README-mold-iso.md" ] || fail 'README-mold-iso.md가 필요합니다.'
+[ -f "$SCRIPT_DIR/README.md" ] || fail 'README.md가 필요합니다.'
 bash -n "$SCRIPT_DIR/update-mold.sh"
 
 for cmd in aspkg rpm; do
@@ -87,7 +87,7 @@ trap 'exit 143' TERM
 ISO_ROOT="$WORK_DIR/iso-root"
 mkdir -p "$ISO_ROOT/rpms"
 cp "$SCRIPT_DIR/update-mold.sh" "$ISO_ROOT/"
-cp "$SCRIPT_DIR/README-mold-iso.md" "$ISO_ROOT/"
+cp "$SCRIPT_DIR/README.md" "$ISO_ROOT/"
 chmod 755 "$ISO_ROOT/update-mold.sh"
 for rpm_path in "${SELECTED_RPMS[@]}"; do
     target="$ISO_ROOT/rpms/$(basename "$rpm_path")"

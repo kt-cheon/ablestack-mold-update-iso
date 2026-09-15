@@ -23,7 +23,7 @@ RPM 업데이트 후 호스트는 `mold-agent`, CCVM은 `mold` 서비스를 재�
 ablestack-mold-update-iso/
 ├── build-mold-iso.sh
 ├── update-mold.sh
-├── README-mold-iso.md
+├── README.md
 ├── .gitignore
 ├── rpms/                      # 빌드할 RPM 5개
 ├── dist/                      # 생성된 ISO
@@ -60,7 +60,7 @@ bash ./build-mold-iso.sh \
 ```text
 /
 ├── update-mold.sh
-├── README-mold-iso.md
+├── README.md
 └── rpms/
     ├── cloudstack-common-<버전>.rpm
     ├── cloudstack-agent-<버전>.rpm
