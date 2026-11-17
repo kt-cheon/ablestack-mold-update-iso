@@ -189,3 +189,27 @@ python3 -B -m unittest discover -s tests -v
 [DNF 테스트 트랜잭션](https://dnf.readthedocs.io/en/stable/conf_ref.html#tsflags),
 [createrepo_c](https://github.com/rpm-software-management/createrepo_c),
 [xorriso 공식 문서](https://www.gnu.org/software/xorriso/man_1_xorriso.html).
+
+## System VM 템플릿 업로드
+
+`upload-systemvm-template.sh`는 기존 방식으로 실행합니다. ISO 경로·관리자 로그인·OS 선택 등
+터미널 입력을 마치면 `nohup`으로 새 세션의 백그라운드 작업을 시작하고 PID를 출력합니다.
+이미지 추출, 임시 HTTP 제공, Mold 등록 및 모든 대상 Zone의 Ready 확인은 백그라운드에서
+계속 진행합니다. SSH 연결 종료 후에도 작업이 유지됩니다. API 인증 키는 명령행·환경 변수·
+임시 설정 파일에 저장하지 않고, 익명 파이프로 작업 프로세스에 전달합니다.
+
+```bash
+bash ./upload-systemvm-template.sh --iso /마운트경로
+tail -f /var/log/ablestack-upload-systemvm-template.log
+```
+
+로그는 기존 내용에 이어 기록하며 백그라운드 작업의 표준 출력과 오류 출력도 포함합니다.
+시작 응답은 업로드 완료를 의미하지 않습니다. 최종 `System VM template job finished: completed.`를
+확인하고, 실패하면 `System VM template job finished: failed (exit=...)` 앞의 오류를 확인합니다.
+작업이 완료될 때까지 원본 ISO/이미지 경로와 실행 스크립트를 유지하고 ISO를 마운트 해제하지 않습니다.
+
+동일 호스트의 중복 실행은 `/run/lock/ablestack-upload-systemvm-template.lock`으로 차단합니다.
+실행 PID는 `/run/ablestack-upload-systemvm-template.pid`에 기록하고 종료 시 정리합니다.
+`--check-only`는 포그라운드에서 인증·설정 확인 결과를 반환하며 업로드 작업을 시작하지 않습니다.
+`--extract-only`의 이미지 추출·검증도 백그라운드로 실행합니다.
+API 설정 파일을 사용하는 기존 `--config` 옵션과 등록 재개 옵션도 그대로 사용할 수 있습니다.

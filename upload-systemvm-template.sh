@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# upload-systemvm.sh: ISO -> extract System VM -> HTTP/API registration -> Ready.
+# ISO -> extract System VM -> HTTP/API registration -> Ready, in a detached worker.
 set -euo pipefail
 export MOLD_SYSTEMVM_SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+export MOLD_SYSTEMVM_SCRIPT_PATH="$MOLD_SYSTEMVM_SCRIPT_DIR/$(basename -- "${BASH_SOURCE[0]}")"
 exec python3 - "$@" <<'PYTHON'
 import argparse
 import base64
 import http.cookiejar
 from contextlib import contextmanager
+import fcntl
 import getpass
 import hashlib
 import hmac
@@ -30,12 +32,86 @@ import urllib.parse
 import urllib.request
 
 
+LOG_PATH = Path('/var/log/ablestack-upload-systemvm-template.log')
+LOCK_PATH = Path('/run/lock/ablestack-upload-systemvm-template.lock')
+PID_PATH = Path('/run/ablestack-upload-systemvm-template.pid')
+_foreground_log = None
+
+
 class Failure(Exception):
     pass
 
 
 def log(message):
-    print(time.strftime('[%Y-%m-%d %H:%M:%S] ') + message, flush=True)
+    line = time.strftime('[%Y-%m-%d %H:%M:%S] ') + message
+    print(line, flush=True)
+    if _foreground_log is not None:
+        _foreground_log.write(line + '\n')
+        _foreground_log.flush()
+
+
+@contextmanager
+def foreground_logging():
+    global _foreground_log
+    descriptor = os.open(str(LOG_PATH), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(descriptor, 'a', encoding='utf-8') as stream:
+        _foreground_log = stream
+        try:
+            yield
+        finally:
+            _foreground_log = None
+
+
+@contextmanager
+def upload_lock():
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open('a') as stream:
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Failure('A System VM template job is already running. Check ' + str(LOG_PATH))
+        # The worker inherits this open file description. Close the parent's
+        # descriptor without LOCK_UN so the detached worker retains the lock.
+        yield stream.fileno()
+
+
+def launch_background(args, lock_fd):
+    nohup = shutil.which('nohup')
+    if not nohup:
+        raise Failure('The nohup command is required.')
+    script = Path(os.environ['MOLD_SYSTEMVM_SCRIPT_PATH']).resolve(strict=True)
+    options = dict(vars(args))
+    api = options.pop('api', None)
+    state = dict(args=options, api=api.worker_config() if api is not None else None)
+    payload = json.dumps(state).encode('utf-8')
+    # Credentials travel only over an inherited anonymous pipe, never through
+    # argv, environment variables, the log, or a temporary configuration file.
+    read_fd, write_fd = os.pipe()
+    with os.fdopen(read_fd, 'rb') as reader, os.fdopen(write_fd, 'wb') as writer:
+        worker = subprocess.Popen(
+            [nohup, '/bin/bash', str(script), '--background-worker', str(read_fd), str(lock_fd)],
+            stdin=subprocess.DEVNULL, stdout=_foreground_log, stderr=subprocess.STDOUT,
+            start_new_session=True, pass_fds=(read_fd, lock_fd))
+        reader.close()
+        writer.write(payload)
+    if worker.poll() not in (None, 0):
+        raise Failure('Background worker exited during startup. Check ' + str(LOG_PATH))
+    log('System VM template job started in the background. PID: ' + str(worker.pid))
+    log('Monitor progress and completion: tail -f ' + str(LOG_PATH))
+
+
+def background_worker(state_fd, lock_fd):
+    os.set_inheritable(lock_fd, False)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with os.fdopen(state_fd, 'r', encoding='utf-8') as stream:
+        state = json.load(stream)
+    args = argparse.Namespace(**state['args'])
+    if not args.extract_only:
+        args.api = Api(state['api'])
+    del state
+    PID_PATH.write_text(str(os.getpid()) + '\n')
+    log('System VM template background worker started: PID=' + str(os.getpid()))
+    run_template_job(args)
 
 
 def checksum(path):
@@ -342,14 +418,20 @@ class Api:
         self.secret = config.get('secret_key') or getpass.getpass('Admin secret key: ')
         if not self.key or not self.secret:
             raise Failure('API credentials are required.')
-        self.context = ssl.create_default_context(cafile=config.get('ca_file'))
+        self.ca_file = config.get('ca_file')
+        self.context = ssl.create_default_context(cafile=self.ca_file)
         algorithm = config.get('signature_algorithm', 'sha256').lower()
         if algorithm not in ('sha256', 'sha1'):
             raise Failure('signature_algorithm must be sha256 or sha1.')
+        self.signature_algorithm = algorithm
         self.digestmod = getattr(hashlib, algorithm)
         self.opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({}),
             urllib.request.HTTPSHandler(context=self.context))
+
+    def worker_config(self):
+        return dict(api_url=self.endpoint, api_key=self.key, secret_key=self.secret,
+                    ca_file=self.ca_file, signature_algorithm=self.signature_algorithm)
 
     def call(self, command, **params):
         params.update(command=command, apikey=self.key, response='json')
@@ -456,9 +538,10 @@ def register_image(args, image):
         register_ready(args, image, digest, args.api)
 
 
-def main():
+def parse_args():
     parser = argparse.ArgumentParser(description='Serve a mounted ISO image and register a KVM SYSTEM template. '
-        'Registers cross-zone; waits for every explicitly specified target zone. Does not recreate VMs.')
+        'Registers cross-zone; waits for every explicitly specified target zone. Does not recreate VMs. '
+        'After interactive input, starts a nohup background worker; monitor ' + str(LOG_PATH))
     source = parser.add_mutually_exclusive_group()
     source.add_argument('--iso', help='ISO file or mounted ISO directory; merge and extract automatically')
     source.add_argument('--base-image', help='Complete base QCOW2; automatically extract the inner template')
@@ -484,7 +567,10 @@ def main():
     parser.add_argument('--poll-interval', type=int, default=15)
     parser.add_argument('--timeout', type=int, default=7200, help='Ready wait timeout in seconds')
     parser.add_argument('--resume-template-id', help='Monitor an already registered template without registering again')
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def prepare_args(args):
     if not (1 <= args.port <= 65535) or args.poll_interval < 1 or args.timeout < 1:
         raise Failure('Invalid port, poll interval or timeout.')
     if not any((args.iso, args.base_image, args.template)):
@@ -512,9 +598,20 @@ def main():
     if not args.extract_only:
         args.api = authenticated_api(args)
         discover_registration(args, args.api)
-        if args.check_only:
+
+
+def main(args):
+    with upload_lock() as lock_fd:
+        # Finish terminal input before detaching. In particular, neither
+        # getpass nor ISO/OS selection may run inside the nohup worker.
+        prepare_args(args)
+        if args.check_only and not args.extract_only:
             log('Preflight complete. No extraction, HTTP server or template registration performed.')
             return
+        launch_background(args, lock_fd)
+
+
+def run_template_job(args):
     with prepare_image(args) as image:
         if not args.name:
             args.name = image.name
@@ -623,13 +720,48 @@ def interrupted(signum, frame):
     raise KeyboardInterrupt
 
 
-signal.signal(signal.SIGTERM, interrupted)
-try:
-    main()
-except KeyboardInterrupt:
-    print('Interrupted. Check the retained registration before resuming.', file=sys.stderr)
-    sys.exit(130)
-except (Failure, OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
-    print('ERROR: ' + str(error), file=sys.stderr)
-    sys.exit(1)
+def run_guarded(worker, args=None):
+    code = 0
+    try:
+        if worker:
+            if len(sys.argv) != 4:
+                raise Failure('Invalid background worker arguments.')
+            background_worker(int(sys.argv[2]), int(sys.argv[3]))
+        else:
+            main(args)
+    except KeyboardInterrupt:
+        log('ERROR: Interrupted. Check the retained registration before resuming.')
+        code = 130
+    except Exception as error:
+        log('ERROR: ' + str(error))
+        code = 1
+    finally:
+        if worker:
+            log('System VM template job finished: ' + (
+                'completed.' if code == 0 else 'failed (exit={}). Check the log.'.format(code)))
+            try:
+                if PID_PATH.read_text().strip() == str(os.getpid()):
+                    PID_PATH.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                log('WARNING: could not remove worker PID file: ' + str(error))
+    return code
+
+
+def entrypoint():
+    signal.signal(signal.SIGTERM, interrupted)
+    if sys.argv[1:2] == ['--background-worker']:
+        return run_guarded(True)
+    args = parse_args()
+    try:
+        with foreground_logging():
+            return run_guarded(False, args)
+    except OSError as error:
+        print('ERROR: Could not open upload log: ' + str(error), file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(entrypoint())
 PYTHON
